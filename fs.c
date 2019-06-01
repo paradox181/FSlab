@@ -44,14 +44,6 @@ struct vfsstate{
 	unsigned long  f_namemax;
 }; 
 
-struct sblock
-{
-	int inode_num;
-	int datanode_num;
-	int inode_start_block;
-	int dnode_start_block;
-};
-
 struct inode
 {
 	mode_t mode;
@@ -90,6 +82,23 @@ void print_directory(struct directory * ptr, int num) {
 	printf("-------\n");
 }
 
+int fs_getattr (const char *path, struct stat *attr);
+int fs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi);
+int fs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi);
+int fs_mknod (const char *path, mode_t mode, dev_t dev);
+int fs_mkdir (const char *path, mode_t mode);
+int fs_rmdir (const char *path);
+int fs_unlink (const char *path);
+int fs_rename (const char *oldpath, const char *newname);
+int fs_write (const char *path, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fi);
+int fs_truncate (const char *path, off_t size);
+int fs_utime (const char *path, struct utimbuf *buffer);
+int fs_statfs (const char *path, struct statvfs *stat);
+int fs_open (const char *path, struct fuse_file_info *fi);
+int fs_release (const char *path, struct fuse_file_info *fi);
+int fs_opendir (const char *path, struct fuse_file_info *fi);
+int fs_releasedir (const char * path, struct fuse_file_info *fi);
+
 struct inode init_inode_content(mode_t file_mode);    //初始化inode
 
 char* get_father_path(char * path);                		//获取父目录的路径
@@ -101,6 +110,7 @@ char * get_data_bitmap();															//读取datablock bitmap内容
 int get_inode_bit_stat(int inode_num);                //读取inodebitmap某一位的值
 int get_data_bit_stat(int data_num);                  //读取datablockbitmap某一位的值
 int get_directory_num(int dir_pos);										//读取目录下的文件数
+void get_directory_by_inode(void * buffer, fuse_fill_dir_t filler, int num);    //根据inode读directory的datablock
 void get_directory(int dir_pos, struct directory * dir_pointer);
 																											//读取目录内容
 struct inode get_inode_by_num(int inode_num);					//根据块号读取inode
@@ -125,13 +135,15 @@ int find_directory_by_num(struct directory * dir_pointer, int dir_num, int inode
 int find_free_inodeblock();																//找到空闲的inode块
 int find_free_datablock();																	//找到空闲的data block
 int find_and_delete_directory(int inode_pos, int inode_num, int * dir_inode_num_array);    //寻找并删除目录
-int find_datablock_by_num(struct inode inode_content, int block_num);				//根据块号找到data block
+int find_datablock_by_idx(struct inode inode_content, int block_num);				//根据块号找到data block
 int find_indirect_by_num(struct inode inode_content, int block_num);				//根据块号找到indirect
 
 void rm_update_father_dir(const char * path, int inode_num);
 void delete_directory(struct directory * dir_pointer, int dir_num, int delete_pos);
 int insert_new_file(const char * path, int inode_num);
 int insert_directory_item(int dir_pos, struct directory dir);
+
+
 
 char * get_father_path(char * path)
 {
@@ -244,6 +256,19 @@ int get_directory_num(int dir_pos)										//读取目录块号
 	return num;
 }
 
+void get_directory_by_inode(void * buffer, fuse_fill_dir_t filler, int num)
+{
+	int dir_num = get_directory_num(num);
+	struct directory * dir_pointer = (struct directory *)malloc(dir_num * dir_size);
+	get_directory(num, dir_pointer);
+	
+	for (int j = 0; j < dir_num; ++j) {
+		filler(buffer, (dir_pointer + j) -> file_name, NULL, 0);
+	}
+	
+	free(dir_pointer);
+}
+
 void get_directory(int dir_pos, struct directory * dir_pointer)
 																											//读取目录内容
 {
@@ -266,7 +291,7 @@ struct inode get_inode_by_num(int inode_num)					//根据块号读取inode
 	disk_read(INODE_START + pos, content);
 
 	struct inode * inode_content_ptr = (struct inode *)malloc(INODE_SIZE);
-	inode_content_ptr = (struct inode *)(content + offset * INODE_SIZE;
+	inode_content_ptr = (struct inode *)(content + offset * INODE_SIZE);
 
 	return inode_content_ptr[off];
 }
@@ -572,7 +597,7 @@ int find_and_delete_directory(int inode_pos, int inode_num, int * dir_inode_num_
 	}
 }
 
-int find_datablock_by_num(struct inode inode_content, int block_num)				//根据块号找到data block
+int find_datablock_by_idx(struct inode inode_content, int block_num)				//根据块号找到data block
 {
 	if(block_num < 14)
 	{
@@ -662,101 +687,519 @@ int insert_new_file(const char * path, int inode_num)
 			break;
 		}
 	}
-	
-}
-int insert_directory_item(int dir_pos, struct directory dir);
+	if (insert_flag == -1 && father_inode.blocks < 14) {
+		int new_data_num = find_free_data();
+		if (new_data_num == -1)
+			return -ENOSPC;
+		write_data_bitmap_stat(new_data_num);
+		father_inode.block[father_inode.blocks++] = new_data_num;
+		write_empty_datablock(new_data_num);
+		insert_flag = insert_directory_item(new_data_num, dir);
+		father_inode.size += BLOCK_SIZE;
+	}
 
+	if(insert_flag == -1)
+	{
+		if (father_inode.blocks == 14) 
+		{
+			int new_data_num = find_free_data();
+			if (new_data_num == -1)
+				return -ENOSPC;
+			write_data_bitmap_stat(new_data_num);
+			father_inode.block[father_inode.blocks++] = new_data_num;
+			write_empty_datablock(new_data_num);
+			father_inode.size += BLOCK_SIZE;
+		}
+		for(i = 0; i < <MIN(2, father_inode.blocks - 14); ++i)
+		{
+			int indirect_num = get_indirect_num(father_inode.block[i + 14]));
+			int * inode_num_pointer = (int*)malloc(sizeof(int) * indirect_num);
+			get_indirect_block(father_inode.block[i + 14], inode_num_pointer);
+			
+			for(j = 0; j < indirect_num; ++j)
+			{
+				insert_flag = insert_directory_item(inode_num_pointer[j], dir);
+				if(insert_flag != -1)
+					break;
+			}
+			if (insert_flag != -1) {
+				free(inode_num_pointer);
+				break;
+			}
+			if (indirect_num == MAX_POINTER_NUM && father_inode.blocks == 15) 
+			{
+				int new_data_num = find_free_data();
+				//printf("%d\n",new_data_num);
+				if (new_data_num == -1)
+					return -ENOSPC;
+				write_data_bitmap_stat(new_data_num);
+				father_inode.block[father_inode.blocks++] = new_data_num;
+				write_empty_datablock(new_data_num);
+				father_inode.size += BLOCK_SIZE;
+			}
+
+			if(indirect_num < MAX_POINTER_NUM)
+			{
+				indirect_num += 1;
+				int new_data_num = find_free_data();
+				if(new_data_num == -1)
+				{
+					return -ENOSPC;
+				}
+				write_data_bitmap_stat(new_data_num);
+				inode_num_pointer = realloc(inode_num_pointer, indirect_num * sizeof(int));
+				*(inode_num_pointer + indirect_num - 1) = new_data_num;
+				write_empty_datablock(new_data_num);
+
+				insert_flag = insert_directory_item(new_data_num, dir);
+
+				char content[BLOCK_SIZE];
+				char * char_num = (char *)(&indirect_num);
+				char * char_array = (char *)inode_num_pointer;
+				memcpy(content, char_num, sizeof(int));
+				memcpy(content + sizeof(int), char_array, sizeof(int) * indirect_num);
+				disk_write(DATA_NODE_START + father_inode.block[i + 14], content);
+				father_inode.size += BLOCK_SIZE;
+			}
+			free(inode_num_pointer);
+			if (insert_flag != -1)
+				break;
+		}
+
+		if (insert_flag == -1)
+		return -ENOSPC;
+
+		father_inode.mtime = time(NULL);
+		father_inode.ctime = time(NULL);
+	
+		write_inode_by_path(father_path, father_inode);
+		free(father_path);
+		return 1;
+	}
+}
+int insert_directory_item(int dir_pos, struct directory dir)
+{
+	int dir_num = get_directory_num(dir_pos);
+	if(dir_num == MAX_DIR_NUM)
+		return -1;
+	struct directory * dir_pointer = (struct directory *)malloc(DIR_SIZE * dir_num);
+	get_directory(dir_pos, dir_pointer);
+	int same_flag = 0;
+	for(int i = 0; i < dir_num; ++i)
+	{
+		if(strcmp((dir_pointer + i) -> file_name, dir.file_name) == 0)
+		{
+			*(dir_pointer + i) = dir;
+			same_flag = 1;
+		}
+	}
+
+	if(same_flag == 0)
+	{
+		dir_num ++;
+		dir_pointer = realloc(dir_pointer, dir_num * DIR_SIZE);
+		*(dir_pointer + dir_num - 1) = dir;
+	}
+
+	write_directory(dir_pos, dir_num, dir_pointer);
+
+	free(dir_pointer);
+	return dir_num;
+}
 
 
 //Format the virtual block device in the following function
 int mkfs()
 {
-	struct sblock *s;
-	s->inode_num = (BLOCK_NUM / 2);
-	s->datanode_num = DATA_NODE_NUM;
-	s->inode_start_block = 4;
-	s->dnode_start_block = 1 + 1 + 2 + BLOCK_NUM / (2 * BLOCK_SIZE / INODE_SIZE)  - 1;
-	disk_write(0, (void*)s);
-	char init[BLOCK_SIZE] = 0;
-	disk_write(1, (void*)init);
-	disk_write(2, (void*)init);
-	disk_write(3, (void*)init);
+	struct vfsstate fs;
+	fs.f_bsize = BLOCK_SIZE;
+	fs.f_blocks = BLOCK_NUM;
+	fs.f_bfree = fs.f_bavail = BLOCK_NUM - 4;
+	fs.f_files = fs.f_ffree = fs.f_favail = max_file_num;
+	fs.f_namemax = FILE_NAME_SIZE;
+	write_supernode(fs);
+	
+	struct inode inode_content;
+	inode_content = init_inode_content(DIRMODE);
+	int inode_num = find_free_inode();
+	int data_num = find_free_data();
+
+	inode_content.block[0] = data_num;
+
+	write_inode_bitmap_stat(inode_num);
+	write_data_bitmap_stat(data_num);
+	
+	write_inode_by_num(inode_num, inode_content);
+	write_empty_datablock(data_num);
 	return 0;
 }
-
-
-
 
 //Filesystem operations that you need to implement
 int fs_getattr (const char *path, struct stat *attr)
 {
 	printf("Getattr is called:%s\n", path);
+	int inode_num = get_inode_by_path(path);
+	if(inode_num == -1)
+	{
+		return -ENOENT;
+	}
+	struct inode inode_info = get_inode_by_num(inode_num);
+
+	attr -> st_mode = inode_info.mode;
+	attr -> st_nlink = inode_info.nlink;
+	attr -> st_uid = inode_info.uid;  
+	attr -> st_gid = inode_info.gid;  
+	attr -> st_size = inode_info.size; 
+	attr -> st_atime = inode_info.atime;
+	attr -> st_mtime = inode_info.mtime;
+	attr -> st_ctime = inode_info.ctime;
 	return 0;
 }
 
 int fs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 {
 	printf("Readdir is called:%s\n", path);
+	struct inode inode_info = get_inode_by_num(get_inode_by_path(path));
+	for (int i = 0; i < MIN(14, inode_info.blocks); ++i)
+	{
+		get_directory_by_inode(buffer, filler, inode_info.block[i]);
+	}
+	for(int i = 0; i < MIN(2, inode_info.blocks - 14); ++i)
+	{
+		int indirect_num = get_indirect_num(inode_info.block[i + 14]);
+
+		int * inode_num_pointer = (int *)malloc(sizeof(int) * indirect_num);
+		get_indirect_block(inode_info.block[i + 14], inode_num_pointer);
+
+		for(int j = 0; j < indirect_num; ++j)
+		{
+			get_directory_by_inode(path, inode_info);
+		}
+		free(inode_num_pointer);
+	}
+	inode_info.atime = time(NULL);
+	write_inode_by_path(path, inode_info);
 	return 0;
 }
 
 int fs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi)
 {
 	printf("Read is called:%s\n", path);
-	return 0;
+	int inode_num = get_inode_by_path(path);
+	struct inode inode_info = get_inode_by_num(inode_num);
+	char * file_info = (char*)malloc(inode_info.size);
+	char block_info[BLOCK_SIZE];
+	int read_flag = 0;
+	off_t off = 0;
+	for(int i = 0; i < MIN(14, inode_info.blocks); ++i)
+	{
+		disk_read(DATA_NODE_START + inode_info.block[i], block_info);
+		size_t batch_size = MIN(BLOCK_SIZE, inode_info.size - off);
+		memcpy(file_info + off, block_info, batch_size);
+		off += batch_size;
+		if(off >= offset + size)
+		{
+			read_flag = 1;
+			break;
+		}
+	}
+	if(read_flag == 0)
+	{
+		for (int i = 0; i < MIN(2, inode_info.blocks - 14); ++i) 
+		{
+			int indirect_num = read_indirect_num(inode_info.block[i + 14]);	
+			int * inode_num_pointer = (int *)malloc(sizeof(int) * indirect_num);
+			get_indirect_block(inode_info.block[i + 14], inode_num_pointer);
+			for (int j = 0; j < indirect_num; ++j) 
+			{
+				disk_read(DATA_NODE_START + inode_info.block[j], block_info);
+				size_t batch_size = MIN(BLOCK_SIZE, inode_info.size - off);
+				memcpy(file_info + off, block_content, batch_size);
+				off += batch_size;
+				if (off >= offset + size) 
+				{
+					read_flag = 1;
+					break;
+				}
+			}
+			if (read_flag == 1)
+				break; 
+			free(inode_num_pointer); 
+		}
+	}
+	size_t copy_size = MIN(size, inode_info.size - offset);
+	memcpy(buffer, file_info + offset, copy_size);
+	return copy_size;
 }
 
 int fs_mknod (const char *path, mode_t mode, dev_t dev)
 {
 	printf("Mknod is called:%s\n",path);
+	int inode_num = find_free_inode();
+	struct inode inode_info;
+	inode_info = init_inode_content(REGMODE);
+	write_inode_bitmap_stat(inode_num);
+	int val = insert_new_file(path, inode_num);
+	if(val == -ENOSPC) return val;
+	write_inode_by_num(inode_num, inode_info);
 	return 0;
 }
 
 int fs_mkdir (const char *path, mode_t mode)
 {
 	printf("Mkdir is called:%s\n",path);
+	int inode_num = find_free_inode();
+	int data_num = find_free_data();
+	struct inode inode_info;
+	inode_info = init_inode_content(DIRMODE);
+	inode_info.block[0] = data_num;
+	
+	write_inode_bitmap_stat(inode_num);
+	write_data_bitmap_stat(data_num);
+	
+	int val = insert_new_file(path, inode_num);
+	if (val == -ENOSPC)
+		return -ENOSPC;
+	
+	write_inode_by_num(inode_num, inode_info);
+	
+	write_empty_datablock(data_num);
 	return 0;
 }
 
 int fs_rmdir (const char *path)
 {
 	printf("Rmdir is called:%s\n",path);
+	int inode_num = get_inode_by_path(path);
+	struct inode inode_info = get_inode_by_num(inode_num);
+	int i = 0;
+	for (i = 0; i < min(14, inode_info.blocks); ++i) 
+	{
+		write_data_bitmap_stat(inode_content.block[i]);
+	}
+	for (i = 0; i < MIN(2, inode_info.blocks - 14); ++i) {
+		int indirect_num = get_indirect_num(inode_info.block[i + 14]);	
+		int * inode_num_pointer = (int *)malloc(sizeof(int) * indirect_num);
+		get_indirect_block(inode_info.block[i + 14], inode_num_pointer);
+		
+		for (int j = 0; j < indirect_num; ++j)
+			write_data_bitmap_stat(inode_num_pointer[j]);
+		write_data_bitmap_stat(inode_content.block[i + 14]);]
+		free(inode_num_pointer);
+	}
+	
+	write_inode_bitmap_stat(inode_num);
+	rm_update_father_dir(path, inode_num);
+	
 	return 0;
 }
 
 int fs_unlink (const char *path)
 {
 	printf("Unlink is callded:%s\n",path);
+	int i, j;
+	int inode_num = get_inode_by_path(path);
+	struct inode inode_info = get_inode_by_num(inode_num);
+	
+	for (i = 0; i < MIN(14, inode_info.blocks); ++i) {
+		write_data_bitmap_stat(inode_info.block[i]);
+	}
+	
+	for (i = 0; i < MIN(2, inode_info.blocks - 14); ++i) {
+		int indirect_num = get_indirect_num(inode_info.block[i + 14]);	
+		int * inode_num_pointer = (int *)malloc(sizeof(int) * indirect_num);
+		get_indirect_block(inode_info.block[i + 14], inode_num_pointer);
+		
+		for (j = 0; j < indirect_num; ++j)
+			write_data_bitmap_stat(inode_num_pointer[j]);
+		write_data_bitmap_stat(inode_info.block[i + 14]);
+		free(inode_num_pointer);
+	}
+	
+	write_inode_bitmap_stat(inode_num);
+	rm_update_father_dir(path, inode_num);
 	return 0;
 }
 
 int fs_rename (const char *oldpath, const char *newname)
 {
 	printf("Rename is called:%s\n",path);
+	int inode_num = get_inode_by_path(oldpath);
+	
+	rm_update_father_dir(oldpath, inode_num);
+	int val = insert_new_file(newname, inode_num);
+	if (val == -ENOSPC)	
+		return -ENOSPC;
 	return 0;
 }
 
 int fs_write (const char *path, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fi)
 {
 	printf("Write is called:%s\n",path);
-	return 0;
+	off_t new_size = offset + size;
+	if(fs_truncate(path, real_size) == -ENOSPC)
+	{
+		return 0;
+	}
+	int start = offset;
+	int end = offset + size - 1;
+	int start_block = start / BLOCK_SIZE;
+	int end_block = end / BLOCK_SIZE;
+	int start_off = start % BLOCK_SIZE;
+	int end_off = end % BLOCK_SIZE;
+
+	struct inode inode_info = get_inode_by_num(get_inode_by_path(path));
+	char content[BLOCK_SIZE];
+	int buffer_off;
+	for(int i = start_block; i <= end_block; ++i)
+	{
+		int data_num = find_datablock_by_idx(inode_info, i);
+		disk_read(DATA_NODE_START, data_num, content);
+		if(i == start_block)
+		{
+			memcpy(content + start_off, buffer, BLOCK_SIZE - start_off);
+			buffer_off += BLOCK_SIZE - start_off;
+			if (i == end_block) {
+				memcpy(content + start_off, buffer, end_off - start_off + 1);
+			}
+		}
+		else 
+		{
+			if (i == end_block) {
+				memcpy(content, buffer + buffer_off, end_off + 1);
+			}
+			else {
+				memcpy(content, buffer + buffer_off, BLOCK_SIZE);
+				string_off += BLOCK_SIZE;
+			}
+		}
+		disk_write(DATA_NODE_START + data_num, content);
+	}
+	return size;
 }
 
 int fs_truncate (const char *path, off_t size)
 {
 	printf("Truncate is called:%s\n",path);
+	int inode_num = get_inode_by_path(path);
+	struct inode inode_info = get_inode_by_num(inode_num);
+	off_t old_size = inode_info.size;
+	off_t new_size = size;
+	int old_blocks = inode_info.blocks;
+	int new_blocks = (new_size + BLOCK_SIZE - 1) / BLOCK_SIZE - 1;
+	if(new_size > old_size)
+	{
+		int delta_blocks = new_blocks - old_blocks;
+		while(inode_info.blocks < 14 && delta_block > 0)
+		{
+			delta_blocks --;
+			int new_data_num = find_free_data();
+			if(new_data_num == -1)
+				return -ENOSPC;
+			write_data_bitmap_stat(new_data_num);
+			inode_info.block[inode_info.blocks++] = new_data_num;
+		}
+		int full_flag = (inode_content.blocks == 14);
+		while(delta_blocks > 0)
+		{
+			if(full_flag)
+			{
+				int new_data_num = find_free_data();
+				if (new_data_num == -1)
+					return -ENOSPC;
+				write_data_bitmap_stat(new_data_num);
+				inode_info.block[inode_info.blocks++] = new_data_num;
+				write_empty_datablock(new_data_num);
+				inode_info.size += BLOCK_SIZE;
+			}
+			for(int i; i < MIN(2, inode_info.blocks - 14); ++i)
+			{
+				int indirect_num = get_indirect_num(inode_info.block[i + 14]);	
+				int * inode_num_pointer = (int *)malloc(sizeof(int) * indirect_num);
+				get_indirect_block(inode_info.block[i + 14], inode_num_pointer);
+				
+				int increase_num = MIN(delta_blocks, MAX_DIR_NUM - indirect_num);
+				delta_blocks -= increase_num;
+				
+				inode_num_pointer = (int *)realloc(inode_num_pointer, sizeof(int) * (indirect_num + increase_num));
+				for (int j = indirect_num; j < indirect_num + increase_num; ++j) 
+				{
+					int new_data_num = find_free_data();
+					if (new_data_num == -1)
+						return -ENOSPC;
+					write_data_bitmap_stat(new_data_num);
+					*(inode_num_pointer + j) = new_data_num;
+				}
+
+				indirect_num = indirect_num + increase_num;
+				char content[BLOCK_SIZE];
+				char * char_num = (char *)(&indirect_num);
+				char * char_array = (char *)inode_num_pointer;
+				memcpy(content, char_num, sizeof(int));
+				memcpy(content + sizeof(int), char_array, sizeof(int) * indirect_num);
+				disk_write(DATA_NODE_START + inode_info.block[i + 14], content);
+
+				full_flag = ((indirect_num == MAX_DIR_NUM) && (inode_info.blocks == 15)); 
+				free(inode_num_pointer);
+			}
+		}
+		if (delta_blocks > 0)
+			return -ENOSPC;
+	}
+	else {
+		for (int j = old_blocks; j > new_blocks; --j) {
+			int indirect_num = find_indirect_by_num(inode_content, j);
+			int data_num = find_datablock_by_num(inode_content, j);
+			
+			write_data_bitmap_value(data_num);
+			if (indirect_num == 0) {
+				inode_content.blocks--;
+			}
+			else {
+				char content[BLOCK_SIZE];
+				disk_read(DATA_NODE_START + indirect_num, content);
+				int num = *(int *)(content);
+				num = num - 1;
+				if (num == 0) {
+					write_data_bitmap_value(indirect_num);
+					inode_content.blocks--;
+				}
+				else {
+					char * char_num = (char *)(&num);
+					memcpy(content, char_num, sizeof(int));
+					disk_write(DATA_NODE_START + indirect_num, content);
+				}
+			}
+		}
+	}
+	inode_info.size = size;
+	write_inode_by_num(inode_num, inode_info);
 	return 0;
 }
 
 int fs_utime (const char *path, struct utimbuf *buffer)
 {
 	printf("Utime is called:%s\n",path);
+	struct inode inode_content = get_inode_by_num(get_inode_by_path(path));
+	inode_content.atime = buffer -> actime;
+	inode_content.mtime = buffer -> modtime;
+	write_inode_by_path(path, inode_content);
 	return 0;
 }
 
 int fs_statfs (const char *path, struct statvfs *stat)
 {
 	printf("Statfs is called:%s\n",path);
+	struct vfsstate fs;
+	fs = get_supernode();
+	stat -> f_bsize = fs.f_bsize;
+	stat -> f_blocks = fs.f_blocks;
+	stat -> f_bfree = fs.f_bfree;
+	stat -> f_bavail = fs.f_bavail;
+	stat -> f_files = fs.f_files;
+	stat -> f_ffree = fs.f_ffree;
+	stat -> f_favail = fs.f_favail;
+	stat -> f_namemax = fs.f_namemax;
 	return 0;
 }
 
